@@ -94,6 +94,12 @@
 #define RAWETH_ADDITION    (18)
 #define HW_CRC_ADDITION    (4)
 
+/* Out-of-order completion modes */
+#define OOO_MODE_OFF        (0)
+#define OOO_MODE_IN_ORDER   (1)
+#define OOO_MODE_OUT_OF_ORDER (2)
+#define OOO_WINDOW_SIZE     (4)  /* Post 4 WQEs before retransmit */
+
 /* Default Values of perftest parameters */
 #define DEF_PORT      (18515)
 #define DEF_IB_PORT   (1)
@@ -684,6 +690,8 @@ struct perftest_parameters {
 	int				cpu_id;
 	int				processing_hints;
 	int				dynamic_cqe_poll;
+	/* Out-of-order completion simulation */
+	int				ooo_completion_mode;  /* 0=off, 1=in-order, 2=out-of-order */
 };
 
 struct report_options {
