@@ -226,6 +226,17 @@ struct dyn_poll_ctx {
 	int stabilization_iters;
 };
 
+/* Out-of-order completion tracking structure */
+struct ooo_completion_tracker {
+	uint8_t *cqe_received;      /* Track which WQEs got CQEs (1=received, 0=not) */
+	uint8_t *wqe_completed;     /* Track which WQEs are considered complete */
+	uint64_t current_window;    /* Current window ID (group of 4 + 1 retransmit) */
+	uint64_t total_posted;      /* Total WQEs posted */
+	uint64_t total_cqes;        /* Total CQEs received */
+	uint64_t total_completed;   /* Total WQEs considered completed */
+	uint64_t total_retransmits; /* Total retransmit WQEs completed */
+};
+
 struct pingpong_context {
 	struct cma cma_master;
 	struct rdma_event_channel		*cm_channel;
@@ -1083,5 +1094,67 @@ int rdma_cm_destroy_cma(struct pingpong_context *ctx,
 int error_handler(char *error_message);
 
 void check_bf_support(struct pingpong_context *ctx);
+
+/* ooo_init_tracker
+ *
+ * Description :
+ *   Initialize the out-of-order completion tracker.
+ *
+ * Parameters :
+ *   user_param - The perftest parameters.
+ *
+ * Return Value : Pointer to initialized tracker or NULL on failure.
+ */
+struct ooo_completion_tracker* ooo_init_tracker(struct perftest_parameters *user_param);
+
+/* ooo_free_tracker
+ *
+ * Description :
+ *   Free the out-of-order completion tracker.
+ *
+ * Parameters :
+ *   tracker - The tracker to free.
+ */
+void ooo_free_tracker(struct ooo_completion_tracker *tracker);
+
+/* ooo_process_completion
+ *
+ * Description :
+ *   Process a completion in out-of-order mode.
+ *   Updates tracker state based on completion mode (in-order vs out-of-order).
+ *
+ * Parameters :
+ *   tracker - The OOO tracker.
+ *   wr_id - Work request ID from the completion.
+ *   user_param - The perftest parameters.
+ *
+ * Return Value : Number of WQEs that can be considered completed.
+ */
+int ooo_process_completion(struct ooo_completion_tracker *tracker, uint64_t wr_id, 
+                           struct perftest_parameters *user_param);
+
+/* ooo_should_post_retransmit
+ *
+ * Description :
+ *   Check if it's time to post a retransmit (every 4 WQEs).
+ *
+ * Parameters :
+ *   posted_count - Number of WQEs posted so far.
+ *
+ * Return Value : 1 if should post retransmit, 0 otherwise.
+ */
+int ooo_should_post_retransmit(uint64_t posted_count);
+
+/* ooo_print_statistics
+ *
+ * Description :
+ *   Print out-of-order completion statistics.
+ *
+ * Parameters :
+ *   tracker - The OOO tracker containing statistics.
+ *   user_param - The perftest parameters (for mode information).
+ */
+void ooo_print_statistics(struct ooo_completion_tracker *tracker, 
+                          struct perftest_parameters *user_param);
 
 #endif /* PERFTEST_RESOURCES_H */
