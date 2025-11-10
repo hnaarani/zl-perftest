@@ -6031,5 +6031,159 @@ int error_handler(char *error_message)
 }
 
 /******************************************************************************
+ * Out-of-Order Completion Simulation Functions
+ ******************************************************************************/
+
+struct ooo_completion_tracker* ooo_init_tracker(struct perftest_parameters *user_param)
+{
+	struct ooo_completion_tracker *tracker;
+	uint64_t max_wqes;
+
+	if (user_param->ooo_completion_mode == OOO_MODE_OFF)
+		return NULL;
+
+	ALLOCATE(tracker, struct ooo_completion_tracker, 1);
+	if (!tracker) {
+		fprintf(stderr, "Failed to allocate OOO tracker\n");
+		return NULL;
+	}
+
+	/* Allocate enough space for all possible WQEs */
+	max_wqes = user_param->iters * 2;  /* Accommodate retransmits */
+	
+	ALLOCATE(tracker->cqe_received, uint8_t, max_wqes);
+	ALLOCATE(tracker->wqe_completed, uint8_t, max_wqes);
+
+	if (!tracker->cqe_received || !tracker->wqe_completed) {
+		fprintf(stderr, "Failed to allocate OOO tracking arrays\n");
+		if (tracker->cqe_received)
+			free(tracker->cqe_received);
+		if (tracker->wqe_completed)
+			free(tracker->wqe_completed);
+		free(tracker);
+		return NULL;
+	}
+
+	memset(tracker->cqe_received, 0, max_wqes);
+	memset(tracker->wqe_completed, 0, max_wqes);
+
+	tracker->current_window = 0;
+	tracker->total_posted = 0;
+	tracker->total_cqes = 0;
+	tracker->total_completed = 0;
+	tracker->total_retransmits = 0;
+
+	printf("Out-of-Order Completion Mode: %s\n", 
+	       user_param->ooo_completion_mode == OOO_MODE_IN_ORDER ? "IN-ORDER" : "OUT-OF-ORDER");
+	printf("  Window size: %d WQEs + 1 retransmit\n", OOO_WINDOW_SIZE);
+
+	return tracker;
+}
+
+void ooo_free_tracker(struct ooo_completion_tracker *tracker)
+{
+	if (!tracker)
+		return;
+
+	if (tracker->cqe_received)
+		free(tracker->cqe_received);
+	if (tracker->wqe_completed)
+		free(tracker->wqe_completed);
+	free(tracker);
+}
+
+int ooo_should_post_retransmit(uint64_t posted_count)
+{
+	/* Every 4 WQEs (1-indexed), we post a 5th retransmit
+	 * So after posting WQE #4, 8, 12, 16, etc., we need retransmit */
+	return ((posted_count > 0) && (posted_count % OOO_WINDOW_SIZE == 0));
+}
+
+int ooo_process_completion(struct ooo_completion_tracker *tracker, uint64_t wr_id,
+                           struct perftest_parameters *user_param)
+{
+	uint32_t wr_index;
+	uint64_t window_id;
+	uint64_t pos_in_window;
+	int newly_completed = 0;
+	int i;
+
+	if (!tracker || user_param->ooo_completion_mode == OOO_MODE_OFF)
+		return 1;  /* Normal completion counting */
+
+	wr_index = get_wr_index(wr_id);
+	tracker->total_cqes++;
+
+	/* Mark this WQE's CQE as received */
+	tracker->cqe_received[wr_index] = 1;
+
+	/* Determine which window this WQE belongs to
+	 * Window structure: WQE 0-3 are in window 0, WQE 4 is retransmit for window 0
+	 *                   WQE 5-8 are in window 1, WQE 9 is retransmit for window 1 */
+	window_id = wr_index / (OOO_WINDOW_SIZE + 1);
+	pos_in_window = wr_index % (OOO_WINDOW_SIZE + 1);
+
+	if (user_param->ooo_completion_mode == OOO_MODE_OUT_OF_ORDER) {
+		/* OUT-OF-ORDER: WQEs complete as soon as their CQE arrives */
+		if (!tracker->wqe_completed[wr_index]) {
+			tracker->wqe_completed[wr_index] = 1;
+			tracker->total_completed++;
+			newly_completed = 1;
+
+			if (pos_in_window == OOO_WINDOW_SIZE) {
+				/* This is a retransmit completing */
+				tracker->total_retransmits++;
+			}
+		}
+	} else if (user_param->ooo_completion_mode == OOO_MODE_IN_ORDER) {
+		/* IN-ORDER: WQEs 1-4 only complete when the retransmit (5th) completes */
+		
+		if (pos_in_window == OOO_WINDOW_SIZE) {
+			/* This is the retransmit (5th WQE) - now complete the whole window */
+			uint64_t window_start = window_id * (OOO_WINDOW_SIZE + 1);
+			
+			/* Complete all WQEs in this window that have received CQEs */
+			for (i = 0; i < OOO_WINDOW_SIZE; i++) {
+				uint64_t wqe_idx = window_start + i;
+				if (tracker->cqe_received[wqe_idx] && !tracker->wqe_completed[wqe_idx]) {
+					tracker->wqe_completed[wqe_idx] = 1;
+					tracker->total_completed++;
+					newly_completed++;
+				}
+			}
+			
+		/* Mark retransmit as completed */
+		if (!tracker->wqe_completed[wr_index]) {
+			tracker->wqe_completed[wr_index] = 1;
+			tracker->total_completed++;
+			newly_completed++;
+			tracker->total_retransmits++;
+		}
+		} else {
+			/* This is one of the first 4 WQEs - just record CQE, don't complete yet */
+			newly_completed = 0;
+		}
+	}
+
+	return newly_completed;
+}
+
+void ooo_print_statistics(struct ooo_completion_tracker *tracker,
+                          struct perftest_parameters *user_param)
+{
+	if (!tracker || user_param->ooo_completion_mode == OOO_MODE_OFF)
+		return;
+
+	printf("\n----- Out-of-Order Completion Statistics -----\n");
+	printf("Mode: %s\n", 
+	       user_param->ooo_completion_mode == OOO_MODE_IN_ORDER ? "IN-ORDER" : "OUT-OF-ORDER");
+	printf("Total WQEs posted: %lu\n", tracker->total_posted);
+	printf("Total CQEs received: %lu\n", tracker->total_cqes);
+	printf("Total retransmits: %lu\n", tracker->total_retransmits);
+	printf("Total completed: %lu\n", tracker->total_completed);
+	printf("----------------------------------------------\n");
+}
+
+/******************************************************************************
  * End
  ******************************************************************************/
