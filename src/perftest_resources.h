@@ -235,6 +235,12 @@ struct ooo_completion_tracker {
 	uint64_t total_cqes;        /* Total CQEs received */
 	uint64_t total_completed;   /* Total WQEs considered completed */
 	uint64_t total_retransmits; /* Total retransmit WQEs completed */
+	
+	/* CQE buffering for IN-ORDER mode */
+	struct ibv_wc *cqe_buffer;  /* Buffer to hold CQEs waiting for retransmit */
+	int *cqe_buffer_valid;      /* Which buffer slots have valid CQEs */
+	int buffer_size;            /* Size of CQE buffer */
+	int cqes_buffered;          /* Count of CQEs currently buffered */
 };
 
 struct pingpong_context {
@@ -243,6 +249,7 @@ struct pingpong_context {
 	struct rdma_cm_id			*cm_id_control;
 	struct rdma_cm_id			*cm_id;
 	struct ibv_context			*context;
+	struct ooo_completion_tracker		*ooo_tracker;
 	#ifdef HAVE_AES_XTS
 	struct mlx5dv_mkey			**mkey;
 	struct mlx5dv_dek			**dek;
@@ -1156,5 +1163,30 @@ int ooo_should_post_retransmit(uint64_t posted_count);
  */
 void ooo_print_statistics(struct ooo_completion_tracker *tracker, 
                           struct perftest_parameters *user_param);
+
+/* poll_cq_in_order_mode
+ *
+ * Description :
+ *   Poll completion queue with IN-ORDER mode enforcement.
+ *   
+ *   This function buffers out-of-order completions and only returns them
+ *   when their corresponding fence/dependency WQE completes.
+ *
+ *   Should ONLY be called when ooo_completion_mode == OOO_MODE_IN_ORDER.
+ *
+ * Parameters :
+ *   tracker - The OOO tracker (must not be NULL).
+ *   user_param - The perftest parameters.
+ *   cq - Completion queue to poll.
+ *   num_entries - Maximum number of CQEs to return.
+ *   wc - Work completion array to fill.
+ *
+ * Return Value : Number of CQEs returned (may be less than polled due to buffering).
+ */
+int poll_cq_in_order_mode(struct ooo_completion_tracker *tracker,
+                          struct perftest_parameters *user_param,
+                          struct ibv_cq *cq,
+                          int num_entries,
+                          struct ibv_wc *wc);
 
 #endif /* PERFTEST_RESOURCES_H */

@@ -91,8 +91,20 @@ static __always_inline int poll_completions(
 	struct ibv_wc *wc,
 	struct dyn_poll_ctx *dyn_ctx,
 	uint64_t curr_count,
-	int *dynamic_enabled)
+	int *dynamic_enabled,
+	struct perftest_parameters *user_param,
+	struct pingpong_context *ctx)
 {
+	int num_entries = dyn_ctx->state.curr_size;
+	
+	/* Check if IN-ORDER completion mode is enabled */
+	if (user_param && ctx && ctx->ooo_tracker && 
+	    user_param->ooo_completion_mode == OOO_MODE_IN_ORDER) {
+		/* Use IN-ORDER poll logic to buffer and reorder completions */
+		return poll_cq_in_order_mode(ctx->ooo_tracker, user_param, cq, num_entries, wc);
+	}
+	
+	/* Normal polling (for OOO_MODE_OFF or OOO_MODE_OUT_OF_ORDER) */
 	if (*dynamic_enabled && curr_count < dyn_ctx->stabilization_iters) {
 		return poll_cq_adaptive(
 			cq,
@@ -102,7 +114,7 @@ static __always_inline int poll_completions(
 			dynamic_enabled
 		);
 	}
-	return ibv_poll_cq(cq, dyn_ctx->state.curr_size, wc);
+	return ibv_poll_cq(cq, num_entries, wc);
 }
 
 struct perftest_parameters* duration_param;
@@ -3844,6 +3856,9 @@ int run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user_pa
 	uintptr_t		primary_send_addr = ctx->sge_list[0].addr;
 	int			address_offset = 0;
 	int			flows_burst_iter = 0;
+	/* OOO tracking - post additional retransmit WQE after every OOO_WINDOW_SIZE WQEs
+	 * poll_cq_in_order_mode() buffers WQEs 0-3 and only returns them when the retransmit WQE completes */
+	uint64_t		ooo_wqe_count = 0;
 
 	struct dyn_poll_ctx *dyn_ctx = init_dyn_poll_ctx(user_param);
 	if (!dyn_ctx) {
@@ -3936,24 +3951,69 @@ int run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user_pa
 					if (swindow >= user_param->rx_depth)
 						break;
 				}
-				if (user_param->post_list == 1 && (ctx->scnt[index] % user_param->cq_mod == 0 && user_param->cq_mod > 1)
-					&& !(ctx->scnt[index] == (user_param->iters - 1) && user_param->test_type == ITERATIONS)) {
+			if (user_param->post_list == 1 && (ctx->scnt[index] % user_param->cq_mod == 0 && user_param->cq_mod > 1)
+				&& !(ctx->scnt[index] == (user_param->iters - 1) && user_param->test_type == ITERATIONS)) {
 
-					ctx->wr[index].send_flags &= ~IBV_SEND_SIGNALED;
+				ctx->wr[index].send_flags &= ~IBV_SEND_SIGNALED;
+			}
+
+			/* OOO mode: Signal all OOO_WINDOW_SIZE WQEs for tracking by poll_cq_in_order_mode() */
+			if (user_param->ooo_completion_mode != OOO_MODE_OFF) {
+				if (ooo_wqe_count < OOO_WINDOW_SIZE) {
+					ctx->wr[index].send_flags |= IBV_SEND_SIGNALED;
 				}
+			}
 
-				if (user_param->noPeak == OFF)
-					user_param->tposted[totscnt] = get_cycles();
+			if (user_param->noPeak == OFF)
+				user_param->tposted[totscnt] = get_cycles();
 
-				if (user_param->test_type == DURATION && user_param->state == END_STATE)
-					break;
+			if (user_param->test_type == DURATION && user_param->state == END_STATE)
+				break;
 
+			/* OOO mode: Update wr_id to track WQE sequence */
+			if (user_param->ooo_completion_mode != OOO_MODE_OFF) {
+				ctx->wr[index].wr_id = build_wr_id(ctx->scnt[index], index);
+			}
+
+			err = post_send_method(ctx, index, user_param);
+			if (err) {
+				fprintf(stderr,"Couldn't post send: qp %d scnt=%lu \n",index,ctx->scnt[index]);
+				return_value = FAILURE;
+				goto cleaning;
+			}
+
+			/* OOO mode: After OOO_WINDOW_SIZE WQEs, post additional retransmit WQE */
+			if (user_param->ooo_completion_mode != OOO_MODE_OFF) {
+				ooo_wqe_count++;
+
+			if (ooo_wqe_count >= OOO_WINDOW_SIZE) {
+				int save_flags = ctx->wr[index].send_flags;
+				
+				/* Retransmit WQE index is 1 position after last regular WQE in this window */
+				/* Regular WQE hasn't been counted yet (line 4037 not reached), so wr_id = scnt + 1 */
+				ctx->wr[index].wr_id = build_wr_id(ctx->scnt[index] + 1, index);
+				
+				/* Post retransmit WQE - poll_cq_in_order_mode() will buffer WQEs 0-3 until this completes */
+				ctx->wr[index].send_flags = IBV_SEND_SIGNALED;
+				
 				err = post_send_method(ctx, index, user_param);
 				if (err) {
-					fprintf(stderr,"Couldn't post send: qp %d scnt=%lu \n",index,ctx->scnt[index]);
-					return_value = FAILURE;
-					goto cleaning;
+					fprintf(stderr,"Couldn't post retransmit WQE: qp %d scnt=%lu \n",index,ctx->scnt[index]);
+						return_value = FAILURE;
+						goto cleaning;
+					}
+					
+					/* Restore flags */
+					ctx->wr[index].send_flags = save_flags;
+					
+					/* Increment scnt for fence WQE (regular WQE will be counted by line 4037) */
+					ctx->scnt[index] += user_param->post_list;
+					totscnt += user_param->post_list;
+					
+					/* Reset counter for next window */
+					ooo_wqe_count = 0;
 				}
+			}
 
 				/* if we have more than single flow and the burst iter is the last one */
 				if (user_param->flows != DEF_FLOWS) {
@@ -4009,15 +4069,17 @@ int run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user_pa
 						goto cleaning;
 					}
 				}
-				/* Dynamic CQE poll size adaptation */
-				ne = poll_completions(
-					ctx->send_cq,
-					wc,
-					dyn_ctx,
-					totccnt,
-					&user_param->dynamic_cqe_poll);
+			/* Dynamic CQE poll size adaptation */
+			ne = poll_completions(
+				ctx->send_cq,
+				wc,
+				dyn_ctx,
+				totccnt,
+				&user_param->dynamic_cqe_poll,
+				user_param,
+				ctx);
 
-				if (ne > 0) {
+			if (ne > 0) {
 					for (i = 0; i < ne; i++) {
 						qp_index = (int)get_wr_id_qp_index(wc[i].wr_id);
 
@@ -4164,15 +4226,17 @@ int run_iter_bw_server(struct pingpong_context *ctx, struct perftest_parameters 
 			if (user_param->test_type == DURATION && user_param->state == END_STATE)
 				break;
 
-			/* Dynamic CQE poll size adaptation */
-			ne = poll_completions(
-				ctx->recv_cq,
-				wc,
-				dyn_ctx,
-				rcnt,
-				&user_param->dynamic_cqe_poll);
+		/* Dynamic CQE poll size adaptation */
+		ne = poll_completions(
+			ctx->recv_cq,
+			wc,
+			dyn_ctx,
+			rcnt,
+			&user_param->dynamic_cqe_poll,
+			user_param,
+			ctx);
 
-			if (ne > 0) {
+		if (ne > 0) {
 				if (firstRx) {
 					set_on_first_rx_packet(user_param);
 					firstRx = 0;
@@ -4415,7 +4479,9 @@ int run_iter_bw_infinitely(struct pingpong_context *ctx,struct perftest_paramete
 				wc,
 				dyn_ctx,
 				totccnt,
-				&user_param->dynamic_cqe_poll);
+				&user_param->dynamic_cqe_poll,
+				user_param,
+				ctx);
 
 			if (ne > 0) {
 
@@ -4515,7 +4581,9 @@ int run_iter_bw_infinitely_server(struct pingpong_context *ctx, struct perftest_
 			wc,
 			dyn_ctx,
 			user_param->iters,
-			&user_param->dynamic_cqe_poll);
+			&user_param->dynamic_cqe_poll,
+			user_param,
+			ctx);
 
 		if (ne > 0) {
 
@@ -6053,25 +6121,37 @@ struct ooo_completion_tracker* ooo_init_tracker(struct perftest_parameters *user
 	
 	ALLOCATE(tracker->cqe_received, uint8_t, max_wqes);
 	ALLOCATE(tracker->wqe_completed, uint8_t, max_wqes);
+	
+	/* Allocate CQE buffer for IN-ORDER mode */
+	tracker->buffer_size = max_wqes;
+	ALLOCATE(tracker->cqe_buffer, struct ibv_wc, tracker->buffer_size);
+	ALLOCATE(tracker->cqe_buffer_valid, int, tracker->buffer_size);
 
-	if (!tracker->cqe_received || !tracker->wqe_completed) {
+	if (!tracker->cqe_received || !tracker->wqe_completed || 
+	    !tracker->cqe_buffer || !tracker->cqe_buffer_valid) {
 		fprintf(stderr, "Failed to allocate OOO tracking arrays\n");
 		if (tracker->cqe_received)
 			free(tracker->cqe_received);
 		if (tracker->wqe_completed)
 			free(tracker->wqe_completed);
+		if (tracker->cqe_buffer)
+			free(tracker->cqe_buffer);
+		if (tracker->cqe_buffer_valid)
+			free(tracker->cqe_buffer_valid);
 		free(tracker);
 		return NULL;
 	}
 
 	memset(tracker->cqe_received, 0, max_wqes);
 	memset(tracker->wqe_completed, 0, max_wqes);
+	memset(tracker->cqe_buffer_valid, 0, tracker->buffer_size * sizeof(int));
 
 	tracker->current_window = 0;
 	tracker->total_posted = 0;
 	tracker->total_cqes = 0;
 	tracker->total_completed = 0;
 	tracker->total_retransmits = 0;
+	tracker->cqes_buffered = 0;
 
 	printf("Out-of-Order Completion Mode: %s\n", 
 	       user_param->ooo_completion_mode == OOO_MODE_IN_ORDER ? "IN-ORDER" : "OUT-OF-ORDER");
@@ -6089,6 +6169,10 @@ void ooo_free_tracker(struct ooo_completion_tracker *tracker)
 		free(tracker->cqe_received);
 	if (tracker->wqe_completed)
 		free(tracker->wqe_completed);
+	if (tracker->cqe_buffer)
+		free(tracker->cqe_buffer);
+	if (tracker->cqe_buffer_valid)
+		free(tracker->cqe_buffer_valid);
 	free(tracker);
 }
 
@@ -6168,6 +6252,74 @@ int ooo_process_completion(struct ooo_completion_tracker *tracker, uint64_t wr_i
 	return newly_completed;
 }
 
+int poll_cq_in_order_mode(struct ooo_completion_tracker *tracker,
+                          struct perftest_parameters *user_param,
+                          struct ibv_cq *cq,
+                          int num_entries,
+                          struct ibv_wc *wc)
+{
+	struct ibv_wc hw_wc[num_entries];
+	int ne, i, j;
+	int returned = 0;
+	
+	/* Sanity check - this function should only be called for IN-ORDER mode */
+	if (!tracker) {
+		fprintf(stderr, "Error: tracker required for IN-ORDER mode\n");
+		return ibv_poll_cq(cq, num_entries, wc);
+	}
+	
+	/* IN-ORDER mode logic: buffer and reorder CQEs */
+	
+	/* Poll hardware CQ */
+	ne = ibv_poll_cq(cq, num_entries, hw_wc);
+	
+	if (ne < 0)
+		return ne;  /* Error */
+	
+	if (ne == 0)
+		return 0;   /* No completions */
+	
+	/* Process each CQE from hardware */
+	for (i = 0; i < ne; i++) {
+		uint32_t wr_idx = get_wr_index(hw_wc[i].wr_id);
+		uint64_t window_id = wr_idx / (OOO_WINDOW_SIZE + 1);
+		uint64_t pos_in_window = wr_idx % (OOO_WINDOW_SIZE + 1);
+		
+		if (pos_in_window == OOO_WINDOW_SIZE) {
+			/* This is a retransmit CQE - trigger window completion */
+			
+			/* First, add this retransmit CQE to output */
+			if (returned < num_entries) {
+				wc[returned++] = hw_wc[i];
+			}
+			
+			/* Now release all buffered CQEs from this window */
+			uint64_t window_start = window_id * (OOO_WINDOW_SIZE + 1);
+			for (j = 0; j < OOO_WINDOW_SIZE; j++) {
+				uint64_t wqe_idx = window_start + j;
+				if (wqe_idx < tracker->buffer_size && 
+				    tracker->cqe_buffer_valid[wqe_idx]) {
+					/* Return this buffered CQE */
+					if (returned < num_entries) {
+						wc[returned++] = tracker->cqe_buffer[wqe_idx];
+					}
+					tracker->cqe_buffer_valid[wqe_idx] = 0;
+					tracker->cqes_buffered--;
+				}
+			}
+		} else {
+			/* This is a regular CQE (positions 0-3) - buffer it */
+			if (wr_idx < tracker->buffer_size) {
+				tracker->cqe_buffer[wr_idx] = hw_wc[i];
+				tracker->cqe_buffer_valid[wr_idx] = 1;
+				tracker->cqes_buffered++;
+			}
+		}
+	}
+	
+	return returned;
+}
+
 void ooo_print_statistics(struct ooo_completion_tracker *tracker,
                           struct perftest_parameters *user_param)
 {
@@ -6181,6 +6333,8 @@ void ooo_print_statistics(struct ooo_completion_tracker *tracker,
 	printf("Total CQEs received: %lu\n", tracker->total_cqes);
 	printf("Total retransmits: %lu\n", tracker->total_retransmits);
 	printf("Total completed: %lu\n", tracker->total_completed);
+	if (user_param->ooo_completion_mode == OOO_MODE_IN_ORDER)
+		printf("CQEs buffered (end): %d\n", tracker->cqes_buffered);
 	printf("----------------------------------------------\n");
 }
 
